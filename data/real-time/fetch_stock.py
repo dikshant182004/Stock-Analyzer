@@ -24,4 +24,5 @@ if __name__ == "__main__":
 
     symbol = sys.argv[1]
     result = fetch_stock_data(symbol)
-    print(json.dumps(result,indent=4))
+    json.dumps(result,indent=4)
+    print(json.dumps(result, indent=4))

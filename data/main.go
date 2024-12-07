@@ -8,6 +8,8 @@ import (
 	"os/exec"
 	"sync"
 	"time"
+
+	"github.com/gorilla/websocket"
 )
 
 // StockData represents the stock information
@@ -23,6 +25,56 @@ type StockData struct {
 // Global storage for stock data
 var stockStore = make(map[string][]StockData)
 var mu sync.Mutex
+
+var upgrader = websocket.Upgrader{
+	ReadBufferSize:  1024,
+	WriteBufferSize: 1024,
+	CheckOrigin: func(r *http.Request) bool {
+		return true // all origins
+	},
+}
+
+// using websocket instead of http
+func stockWebSocketHandler(w http.ResponseWriter, r *http.Request) {
+	conn, err := upgrader.Upgrade(w, r, nil)
+
+	if err != nil {
+		log.Printf("WebSocket upgrade error:")
+	}
+	defer conn.Close()
+
+	// Get stock symbol from query
+	symbol := r.URL.Query().Get("symbol")
+	if symbol == "" {
+		log.Println("No stock symbol provided")
+		// Send a message to the client if the symbol is missing
+		conn.WriteMessage(websocket.TextMessage, []byte("Error: No stock symbol provided"))
+		return
+	}
+
+	// Stream stock data to WebSocket client
+	for {
+		mu.Lock()
+		data, exists := stockStore[symbol]
+		mu.Unlock()
+
+		if !exists {
+			data = append(data, StockData{
+				Symbol:      symbol,
+				Price:       0.0,
+				LastUpdated: time.Now().Format(time.RFC3339),
+			})
+		}
+
+		if err := conn.WriteJSON(data); err != nil {
+			log.Printf("Error writing WebSocket message: %v", err)
+			return
+		}
+
+		time.Sleep(1 * time.Second) // Adjust as needed for real-time updates
+	}
+
+}
 
 func fetchStock(symbol string) {
 	for {
@@ -68,27 +120,6 @@ func fetchStock(symbol string) {
 	}
 }
 
-// Serve stock data over HTTP
-func stockHandler(w http.ResponseWriter, r *http.Request) {
-	symbol := r.URL.Query().Get("symbol")
-	if symbol == "" {
-		http.Error(w, "Symbol is required", http.StatusBadRequest)
-		return
-	}
-
-	mu.Lock()
-	data, exists := stockStore[symbol]
-	mu.Unlock()
-
-	if !exists {
-		http.Error(w, "Stock data not found", http.StatusNotFound)
-		return
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(data)
-}
-
 func main() {
 
 	symbols := []string{"500112", "500325", "532540"}
@@ -105,7 +136,7 @@ func main() {
 	}
 
 	// Start HTTP server to serve data
-	http.HandleFunc("/stock", stockHandler)
+	http.HandleFunc("/ws", stockWebSocketHandler)
 	fmt.Println("Server running on http://localhost:8080")
 	log.Fatal(http.ListenAndServe(":8080", nil))
 
