@@ -20,3 +20,10 @@ st.title("Real-time Stock Updates")
 if "data" in st.session_state:
     for item in st.session_state["data"][-10:]:
         st.write(item)
+
+
+# celery 
+# Go
+# streamlit
+# Redis
+# Postgresql

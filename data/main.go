@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -9,6 +10,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/go-redis/redis/v8"
 	"github.com/gorilla/websocket"
 )
 
@@ -22,24 +24,26 @@ type StockData struct {
 	Error       string  `json:"error,omitempty"`
 }
 
-// Global storage for stock data
-var stockStore = make(map[string][]StockData)
-var mu sync.Mutex
+// a global variable representing the redis client to connect and interact with redis server
 
-var upgrader = websocket.Upgrader{
-	ReadBufferSize:  1024,
-	WriteBufferSize: 1024,
-	CheckOrigin: func(r *http.Request) bool {
-		return true // all origins
-	},
-}
+var (
+	redisClient *redis.Client
+	upgrader    = websocket.Upgrader{
+		ReadBufferSize:  1024,
+		WriteBufferSize: 1024,
+		CheckOrigin: func(r *http.Request) bool {
+			return true // Allow all origins
+		},
+	}
+)
 
-// using websocket instead of http
+// WebSocket handler to subscribe to stock updates
 func stockWebSocketHandler(w http.ResponseWriter, r *http.Request) {
+	// upgrading http to websocket
 	conn, err := upgrader.Upgrade(w, r, nil)
-
 	if err != nil {
-		log.Printf("WebSocket upgrade error:")
+		log.Printf("WebSocket upgrade error: %v", err)
+		return
 	}
 	defer conn.Close()
 
@@ -47,35 +51,32 @@ func stockWebSocketHandler(w http.ResponseWriter, r *http.Request) {
 	symbol := r.URL.Query().Get("symbol")
 	if symbol == "" {
 		log.Println("No stock symbol provided")
-		// Send a message to the client if the symbol is missing
 		conn.WriteMessage(websocket.TextMessage, []byte("Error: No stock symbol provided"))
 		return
 	}
 
-	// Stream stock data to WebSocket client
+	// Subscribe to the Redis channel for the stock symbol to receive messages from it
+	pubsub := redisClient.Subscribe(context.Background(), symbol) // publisher / Subscriber
+	defer pubsub.Close()
+
+	// Start receiving messages from Redis and send them to the WebSocket client
 	for {
-		mu.Lock()
-		data, exists := stockStore[symbol]
-		mu.Unlock()
-
-		if !exists {
-			data = append(data, StockData{
-				Symbol:      symbol,
-				Price:       0.0,
-				LastUpdated: time.Now().Format(time.RFC3339),
-			})
-		}
-
-		if err := conn.WriteJSON(data); err != nil {
-			log.Printf("Error writing WebSocket message: %v", err)
+		msg, err := pubsub.ReceiveMessage(context.Background())
+		if err != nil {
+			log.Printf("Error receiving message from Redis: %v", err)
 			return
 		}
 
-		time.Sleep(1 * time.Second) // Adjust as needed for real-time updates
+		// Send the message to the WebSocket client
+		if err := conn.WriteMessage(websocket.TextMessage, []byte(msg.Payload)); err != nil {
+			log.Printf("Error writing WebSocket message: %v", err)
+			return
+		}
+		log.Printf("Received from Redis: channel=%s, message=%s", msg.Channel, msg.Payload)
 	}
-
 }
 
+// Fetch stock data and publish updates to Redis
 func fetchStock(symbol string) {
 	for {
 		cmd := exec.Command("C:/Users/Dell/AppData/Local/Programs/Python/Python311/python.exe", "J:/personel/StockAnalyzer/data/real-time/fetch_stock.py", symbol)
@@ -87,14 +88,13 @@ func fetchStock(symbol string) {
 			continue
 		}
 
-		var data StockData // creating a variable of above struct
+		var data StockData
 		if !json.Valid(output) {
 			log.Printf("Invalid JSON for stock %s: %s", symbol, string(output))
 			time.Sleep(10 * time.Second)
 			continue
 		}
 
-		// just encoding the json data into go struct var
 		if err := json.Unmarshal(output, &data); err != nil {
 			log.Printf("Error decoding JSON for %s: %v", symbol, err)
 			time.Sleep(10 * time.Second)
@@ -107,35 +107,50 @@ func fetchStock(symbol string) {
 			continue
 		}
 
-		mu.Lock()
-		// just storing the previously fetched data for visualization stuff
-		stockStore[symbol] = append(stockStore[symbol], data)
-		if len(stockStore[symbol]) > 100 {
-			stockStore[symbol] = stockStore[symbol][1:]
-		}
-		mu.Unlock()
+		// Publish stock data to Redis channel
+		dataJSON, _ := json.Marshal(data)
+		// publish -any client or process sends messages to a channel(virtual room {where messages
+		// are sent and received}) with the named topic :-symbol
 
-		log.Printf("Updated stock data for %s: %+v", symbol, data)
+		// ~ here the symbol name is created as a channel and messages are sent in it
+		err = redisClient.Publish(context.Background(), symbol, dataJSON).Err()
+		if err != nil {
+			log.Printf("Error publishing to Redis channel %s: %v", symbol, err)
+		}
+
+		// log.Printf("Updated stock data for %s: %+v", symbol, data)
 		time.Sleep(10 * time.Second) // Adjust as needed
 	}
 }
 
 func main() {
+	// Initialize Redis client
+	redisClient = redis.NewClient(&redis.Options{
+		Addr:     "localhost:6379",
+		Password: "",
+		DB:       0, // Use default DB
+	})
 
+	// Test Redis connection
+	if _, err := redisClient.Ping(context.Background()).Result(); err != nil {
+		log.Fatalf("Failed to connect to Redis: %v", err)
+	}
+	log.Println("Connected to Redis")
+
+	// List of stock symbols to monitor
 	symbols := []string{"500112", "500325", "532540"}
 
-	// making go routine for every obtained symbol
-
+	// Fetch stock data in separate goroutines
 	wg := &sync.WaitGroup{}
 	for _, symbol := range symbols {
 		wg.Add(1)
 		go func(s string) {
 			defer wg.Done()
-			fetchStock(symbol)
+			fetchStock(s)
 		}(symbol)
 	}
 
-	// Start HTTP server to serve data
+	// Start WebSocket server
 	http.HandleFunc("/ws", stockWebSocketHandler)
 	fmt.Println("Server running on http://localhost:8080")
 	log.Fatal(http.ListenAndServe(":8080", nil))
